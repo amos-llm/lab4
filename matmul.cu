@@ -21,6 +21,8 @@ void cuda_check(cudaError_t code, const char *file, int line) {
         cuda_check((x), __FILE__, __LINE__); \
     } while (0)
 
+template <typename T> __host__ __device__ T cdiv(T a, T b) { return (a + b - 1) / b; }
+
 ////////////////////////////////////////////////////////////////////////////////
 // CPU Reference Implementation (Too slow to actually run!)
 //
@@ -49,6 +51,10 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
+constexpr int32_t BLOCK_M = 32;
+constexpr int32_t BLOCK_N = 32;
+constexpr int32_t BLOCK_K = 32;
+
 __global__ void matmul_l1(
     int32_t size_i,
     int32_t size_j,
@@ -56,7 +62,49 @@ __global__ void matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your GPU code here */
+    __shared__ float smem_a[BLOCK_M][BLOCK_K];
+    __shared__ float smem_b[BLOCK_K][BLOCK_N];
+
+    float acc = 0.0f;
+    for (int tile_k = 0; tile_k < cdiv(size_k, BLOCK_K); ++tile_k) {
+        for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < BLOCK_M * BLOCK_K;
+             i += blockDim.x * blockDim.y) {
+            int local_row = i / BLOCK_K;
+            int local_col = i % BLOCK_K;
+            int global_row = blockIdx.y * BLOCK_M + local_row;
+            int global_col = tile_k * BLOCK_K + local_col;
+            if (global_row < size_i && global_col < size_k) {
+                smem_a[local_row][local_col] = a[global_row * size_k + global_col];
+            } else {
+                smem_a[local_row][local_col] = 0.0f;
+            }
+        }
+        for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < BLOCK_K * BLOCK_N;
+             i += blockDim.x * blockDim.y) {
+            int local_row = i / BLOCK_N;
+            int local_col = i % BLOCK_N;
+            int global_row = tile_k * BLOCK_K + local_row;
+            int global_col = blockIdx.x * BLOCK_N + local_col;
+            if (global_row < size_k && global_col < size_j) {
+                smem_b[local_row][local_col] = b[global_row * size_j + global_col];
+            } else {
+                smem_b[local_row][local_col] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int k = 0; k < BLOCK_K; ++k) {
+            acc += smem_a[threadIdx.y][k] * smem_b[k][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    int global_row = blockIdx.y * BLOCK_M + threadIdx.y;
+    int global_col = blockIdx.x * BLOCK_N + threadIdx.x;
+    if (global_row < size_i && global_col < size_j) {
+        c[global_row * size_j + global_col] = acc;
+    }
 }
 
 void launch_matmul_l1(
@@ -66,7 +114,10 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+    dim3 block(BLOCK_N, BLOCK_M);
+    dim3 grid(cdiv(size_j, BLOCK_N), cdiv(size_i, BLOCK_M));
+    matmul_l1<<<grid, block>>>(size_i, size_j, size_k, a, b, c);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 }; // namespace matmul_l1
@@ -76,6 +127,12 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+constexpr int32_t BLOCK_M = 64;
+constexpr int32_t BLOCK_N = 64;
+constexpr int32_t BLOCK_K = 16;
+constexpr int32_t TM = 4;
+constexpr int32_t TN = 4;
+
 __global__ void matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
@@ -83,7 +140,73 @@ __global__ void matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your GPU code here */
+    __shared__ float smem_a[BLOCK_M][BLOCK_K];
+    __shared__ float smem_b[BLOCK_K][BLOCK_N];
+
+    float acc[TM][TN] = {0.0f};
+    float reg_a[TM];
+    float reg_b[TN];
+
+    for (int tile_k = 0; tile_k < cdiv(size_k, BLOCK_K); ++tile_k) {
+        for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < BLOCK_M * BLOCK_K;
+             i += blockDim.x * blockDim.y) {
+            int local_row = i / BLOCK_K;
+            int local_col = i % BLOCK_K;
+            int global_row = blockIdx.y * BLOCK_M + local_row;
+            int global_col = tile_k * BLOCK_K + local_col;
+            if (global_row < size_i && global_col < size_k) {
+                smem_a[local_row][local_col] = a[global_row * size_k + global_col];
+            } else {
+                smem_a[local_row][local_col] = 0.0f;
+            }
+        }
+        for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < BLOCK_K * BLOCK_N;
+             i += blockDim.x * blockDim.y) {
+            int local_row = i / BLOCK_N;
+            int local_col = i % BLOCK_N;
+            int global_row = tile_k * BLOCK_K + local_row;
+            int global_col = blockIdx.x * BLOCK_N + local_col;
+            if (global_row < size_k && global_col < size_j) {
+                smem_b[local_row][local_col] = b[global_row * size_j + global_col];
+            } else {
+                smem_b[local_row][local_col] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int k = 0; k < BLOCK_K; ++k) {
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                reg_a[i] = smem_a[threadIdx.y * TM + i][k];
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                reg_b[j] = smem_b[k][threadIdx.x * TN + j];
+            }
+
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += reg_a[i] * reg_b[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            int global_row = blockIdx.y * BLOCK_M + threadIdx.y * TM + i;
+            int global_col = blockIdx.x * BLOCK_N + threadIdx.x * TN + j;
+            if (global_row < size_i && global_col < size_j) {
+                c[global_row * size_j + global_col] = acc[i][j];
+            }
+        }
+    }
 }
 
 void launch_matmul_l1_reg(
@@ -93,7 +216,10 @@ void launch_matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+    dim3 block(BLOCK_N / TN, BLOCK_M / TM);
+    dim3 grid(cdiv(size_j, BLOCK_N), cdiv(size_i, BLOCK_M));
+    matmul_l1_reg<<<grid, block>>>(size_i, size_j, size_k, a, b, c);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 }; // namespace matmul_l1_reg
