@@ -195,7 +195,9 @@ __global__ void matmul_l1_reg(
                 }
             }
         }
-        __syncthreads();
+        if (tile_k + 1 < num_k_tiles) {
+            __syncthreads();
+        }
     }
 
 #pragma unroll
