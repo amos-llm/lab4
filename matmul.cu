@@ -147,9 +147,12 @@ __global__ void matmul_l1_reg(
     float reg_a[TM];
     float reg_b[TN];
 
-    for (int tile_k = 0; tile_k < cdiv(size_k, BLOCK_K); ++tile_k) {
-        for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < BLOCK_M * BLOCK_K;
-             i += blockDim.x * blockDim.y) {
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int threads_per_block = blockDim.x * blockDim.y;
+    int num_k_tiles = cdiv(size_k, BLOCK_K);
+
+    for (int tile_k = 0; tile_k < num_k_tiles; ++tile_k) {
+        for (int i = tid; i < BLOCK_M * BLOCK_K; i += threads_per_block) {
             int local_row = i / BLOCK_K;
             int local_col = i % BLOCK_K;
             int global_row = blockIdx.y * BLOCK_M + local_row;
@@ -160,8 +163,7 @@ __global__ void matmul_l1_reg(
                 smem_a[local_row][local_col] = 0.0f;
             }
         }
-        for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < BLOCK_K * BLOCK_N;
-             i += blockDim.x * blockDim.y) {
+        for (int i = tid; i < BLOCK_K * BLOCK_N; i += threads_per_block) {
             int local_row = i / BLOCK_N;
             int local_col = i % BLOCK_N;
             int global_row = tile_k * BLOCK_K + local_row;
